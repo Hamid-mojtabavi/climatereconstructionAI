@@ -5,23 +5,21 @@ import numpy as np
 import torch
 import xarray as xr
 from torch.utils.data import Dataset, Sampler
+from torch.functional import F
 
 from .netcdfchecker import dataset_formatter
 from .normalizer import img_normalization, bnd_normalization
 from .. import config as cfg
 
-
-def load_steadymask(path, mask_names, data_types, device):
-    if mask_names is None:
+def load_steadymask(steady_mask_dir_dict, device):
+    if steady_mask_dir_dict is None:
         return None
     else:
-        assert len(mask_names) == cfg.out_channels
-        if cfg.n_target_data == 0:
-            steady_mask = load_netcdf(path, mask_names, data_types[:cfg.out_channels])[0]
-        else:
-            steady_mask = load_netcdf(path, mask_names, data_types[-cfg.n_target_data:])[0]
-        # stack + squeeze ensures that it works with steady masks with one timestep or no timestep
-        return torch.stack([torch.from_numpy(np.array(mask)).to(device) for mask in steady_mask]).squeeze()
+        mask_data = []
+        for (mask_name, mask_type), mask_dirs in steady_mask_dir_dict.items():
+            data, _, _ = load_netcdf(mask_dirs, len(mask_dirs) * [mask_type])
+            mask_data.append(np.concatenate(data))
+        return torch.stack([torch.from_numpy(np.array(mask)).to(device) for mask in mask_data]).squeeze()
 
 
 class InfiniteSampler(Sampler):
@@ -69,10 +67,14 @@ def nc_loadchecker(filename, data_type):
         ds = xr.open_dataset(filename)
     except Exception:
         try:
-            ds = xr.open_dataset(filename, decode_times=False)
+            ds = xr.open_dataset(filename, decode_times=True)
         except Exception:
-            raise ValueError('Impossible to read {}.'
-                             '\nPlease, check that it is a netCDF file and it is not corrupted.'.format(basename))
+            try:
+                data = nc.open_data(filename)
+                ds = data.to_xarray(cdo_times=True)
+            except Exception:
+                raise ValueError('Impossible to read {}.'
+                                 '\nPlease, check that it is a netCDF file and it is not corrupted.'.format(basename))
 
     ds1 = dataset_formatter(ds, data_type, basename)
     ds = ds.drop_vars(data_type)
@@ -90,53 +92,61 @@ def nc_loadchecker(filename, data_type):
     return [ds, ds1, dims, coords], data, data.shape[0], data.shape[1:]
 
 
-def load_netcdf(path, data_names, data_types, keep_dss=False):
-    if data_names is None:
-        return None, None, None
+def load_netcdf(data_paths, data_types, keep_dss=False, mask=False):
+    if data_paths is None:
+        return None, None
     else:
-        ndata = len(data_names)
+        ndata = len(data_paths)
         assert ndata == len(data_types)
+        dss, data, lengths, sizes = zip(*[nc_loadchecker(data_paths[i], data_types[i]) for i in range(ndata)])
 
-        dss, data, lengths, sizes = zip(*[nc_loadchecker('{}{}'.format(path, data_names[i]),
-                                                         data_types[i]) for i in range(ndata)])
-
-        assert len(set(lengths)) == 1
+        if cfg.flip_dims and not mask:
+            for dim in cfg.flip_dims:
+                data = np.flip(data, dim)
 
         if keep_dss:
-            return dss, data, lengths[0], sizes
+            return dss[0], data, lengths[0], (sizes[0],)
         else:
-            return data, lengths[0], sizes
+            return data, lengths[0], (sizes[0],)
 
 
 class NetCDFLoader(Dataset):
-    def __init__(self, data_root, img_names, mask_root, mask_names, split, data_types, time_steps, train_stats=None):
-
+    def __init__(self, data_dir_dict, mask_dir_dict, time_steps, train_stats=None, remap_data=None):
         super(NetCDFLoader, self).__init__()
 
         self.random = random.Random(cfg.loop_random_seed)
 
-        self.data_types = data_types
         self.time_steps = time_steps
 
         self.n_time_steps = sum(time_steps) + 1
 
-        mask_path = mask_root
-        if split == 'infill':
-            data_path = '{:s}/test/'.format(data_root)
-            self.xr_dss, self.img_data, self.img_length, self.img_sizes = load_netcdf(data_path, img_names, data_types,
-                                                                                      keep_dss=True)
-        else:
-            if split == 'train':
-                data_path = '{:s}/train/'.format(data_root)
-            else:
-                data_path = '{:s}/val/'.format(data_root)
-                if not cfg.shuffle_masks:
-                    mask_path = '{:s}/val/'.format(mask_root)
-            self.img_data, self.img_length, self.img_sizes = load_netcdf(data_path, img_names, data_types)
+        self.img_data, self.data_types, self.mask_data, self.xr_dss = [], [], [], []
 
-        self.mask_data, self.mask_length, _ = load_netcdf(mask_path, mask_names, data_types)
+        self.remap_data = remap_data
 
-        if self.mask_data is None:
+        for (data_name, data_type), data_dirs in data_dir_dict.items():
+            data = []
+            xr_dss = None
+            for data_dir in data_dirs:
+                if xr_dss:
+                    dir_data, _, self.img_sizes = load_netcdf([data_dir],
+                                                                            [data_type])
+                else:
+                    xr_dss, dir_data, _, self.img_sizes = load_netcdf([data_dir],
+                                                                                    [data_type],
+                                                                                    keep_dss=True)
+                data.append(np.concatenate(dir_data))
+            data = np.concatenate(data)
+            self.img_length = len(data)
+            self.xr_dss.append(xr_dss)
+            self.img_data.append(data)
+            self.data_types.append(data_type)
+        if mask_dir_dict:
+            for (mask_name, mask_type), mask_dirs in mask_dir_dict.items():
+                mask_data, self.mask_length, _ = load_netcdf(mask_dirs, len(mask_dirs)*[mask_type], mask=True)
+                self.mask_data.append(mask_data)
+
+        if not self.mask_data:
             self.mask_length = self.img_length
         else:
             if not cfg.shuffle_masks:
@@ -145,10 +155,13 @@ class NetCDFLoader(Dataset):
         self.img_mean, self.img_std, self.img_znorm = img_normalization(self.img_data)
 
         self.bounds = bnd_normalization(self.img_mean, self.img_std, train_stats)
+        if self.remap_data:
+            _, x, y = self.remap_data.split("_")
+            self.img_sizes = ((int(x), int(y)),)
 
     def load_data(self, ind_data, img_indices, mask_indices):
 
-        if self.mask_data is None:
+        if not self.mask_data:
             # Get masks from images
             image = np.array(self.img_data[ind_data][mask_indices])
             mask = torch.from_numpy((1 - (np.isnan(image))).astype(image.dtype))
@@ -181,6 +194,22 @@ class NetCDFLoader(Dataset):
         images = torch.stack([images], dim=1)
         masks = torch.stack([masks], dim=1)
 
+        # interpolate
+        if self.remap_data:
+            mode, x, y = self.remap_data.split("_")
+            x, y = int(x), int(y)
+            if masks.shape[-1] != y or masks.shape[-2] != x:
+                masks = F.interpolate(masks, (x, y), mode=mode)
+            if images.shape[-1] != y or images.shape[-2] != x:
+                images = F.interpolate(images, (x, y), mode=mode)
+
+        if ind_data != cfg.n_target_data and cfg.down_sample_data:
+            x_orig, y_orig = images.shape[-2], images.shape[-1]
+            mode, x, y = cfg.down_sample_data.split("_")
+            x, y = int(x), int(y)
+            images = F.interpolate(images, (x, y), mode=mode)
+            images = F.interpolate(images, (x_orig, y_orig), mode=mode)
+
         return images, masks
 
     def __getitem__(self, index):
@@ -203,10 +232,15 @@ class NetCDFLoader(Dataset):
                 masked.append(image * mask)
 
         if cfg.channel_steps:
-            return torch.cat(masked, dim=0).transpose(0, 1), torch.cat(masks, dim=0) \
-                .transpose(0, 1), torch.cat(images, dim=0).transpose(0, 1), index
+            masked, masks, images = torch.cat(masked, dim=0).transpose(0, 1), torch.cat(masks, dim=0) \
+                .transpose(0, 1), torch.cat(images, dim=0).transpose(0, 1)
         else:
-            return torch.cat(masked, dim=1), torch.cat(masks, dim=1), torch.cat(images, dim=1), index
+            masked, masks, images = torch.cat(masked, dim=1), torch.cat(masks, dim=1), torch.cat(images, dim=1)
+
+        if cfg.predict_diff:
+            images -= masked
+
+        return masked.float(), masks.float(), images.float(), index
 
     def __len__(self):
         return self.img_length

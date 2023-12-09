@@ -12,11 +12,24 @@ def get_format(dataset_name):
     return dataset_format[str(dataset_name)]
 
 
-def get_passed_arguments(args, parser):
-    sentinel = object()
-    ns = argparse.Namespace(**{key: sentinel for key in vars(args)})
-    parser.parse_known_args(namespace=ns)
-    return {key: val for key, val in vars(ns).items() if val is not sentinel}
+def get_passed_arguments(argv, arg_parser):
+    passed_arguments = {}
+    if argv[0] == '--load-from-file' or argv[0] == '-f':
+        argv = open(argv[1]).read().split()
+    args = vars(arg_parser.parse_args(argv))
+    for action in vars(arg_parser)['_actions']:
+        option_str = action.option_strings[-1]
+        if option_str in argv:
+            passed_arguments[action.dest] = args[action.dest]
+    return passed_arguments
+
+
+def parse_json(json_dict):
+    parsed_dict = {}
+    for key, value in json_dict.items():
+        dname, dtype = key.split(",")
+        parsed_dict[(dname, dtype)] = value
+    return parsed_dict
 
 
 class LoadFromFile(argparse.Action):
@@ -137,23 +150,37 @@ def global_args(parser, arg_file=None, prog_func=None):
 
     assert len(time_steps) == 2
 
-    return args
+
+    # load data paths
+    global mask_data_dict
+    mask_data_dict = None
+    global steady_mask_data_dict
+    steady_mask_data_dict = None
+    with open(data_path) as json_file:
+        data = json.load(json_file)
+
+        if "train" in data.keys():
+            global train_data_dict
+            train_data_dict = parse_json(data["train"])
+        if "val" in data.keys():
+            global val_data_dict
+            val_data_dict = parse_json(data["val"])
+        if "test" in data.keys():
+            global test_data_dict
+            test_data_dict = parse_json(data["test"])
+        if "mask" in data.keys():
+            mask_data_dict = parse_json(data["mask"])
+        if "steady_mask" in data.keys():
+            steady_mask_data_dict = parse_json(data["steady_mask"])
+
+    return argv
 
 
 def set_common_args():
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument('--data-root-dir', type=str, default='../data/',
-                            help="Root directory containing the climate datasets")
-    arg_parser.add_argument('--mask-dir', type=str, default='masks/', help="Directory containing the mask datasets")
+    arg_parser.add_argument('--data-path', type=str, default='../data/data.json',
+                            help="JSON file path containing the paths of climate datasets")
     arg_parser.add_argument('--log-dir', type=str, default='logs/', help="Directory where the log files will be stored")
-    arg_parser.add_argument('--data-names', type=str_list, default='train.nc',
-                            help="Comma separated list of netCDF files (climate dataset) for training/infilling")
-    arg_parser.add_argument('--mask-names', type=str_list, default=None,
-                            help="Comma separated list of netCDF files (mask dataset). "
-                                 "If None, it extracts the masks from the climate dataset")
-    arg_parser.add_argument('--data-types', type=str_list, default='tas',
-                            help="Comma separated list of variable types, "
-                                 "in the same order as data-names and mask-names")
     arg_parser.add_argument('--n-target-data', type=int, default=0,
                             help="Number of data-names (from last) to be used as target data")
     arg_parser.add_argument('--device', type=str, default='cuda', help="Device used by PyTorch (cuda or cpu)")
@@ -168,6 +195,7 @@ def set_common_args():
     arg_parser.add_argument('--encoding-layers', type=int_list, default='3',
                             help="Number of encoding layers in the CNN")
     arg_parser.add_argument('--pooling-layers', type=int_list, default='0', help="Number of pooling layers in the CNN")
+    arg_parser.add_argument('--flip-dims', type=int_list, default=None, help="flip-dimensions")
     arg_parser.add_argument('--conv-factor', type=int, default=None, help="Number of channels in the deepest layer")
     arg_parser.add_argument('--weights', type=str, default=None, help="Initialization weight")
     arg_parser.add_argument('--steady-masks', type=str_list, default=None,
@@ -198,6 +226,9 @@ def set_common_args():
     arg_parser.add_argument('--max-bounds', type=float_list, default="inf",
                             help="Comma separated list of values defining the permitted upper-bound of output values")
     arg_parser.add_argument('--profile', action='store_true', help="Profile code using tensorboard profiler")
+    arg_parser.add_argument('--remap-data', type=str, default=None, help="Remap technique that should be applied")
+    arg_parser.add_argument('--down-sample-data', type=str, default=None, help="Use a custom padding for global dataset")
+    arg_parser.add_argument('--predict-diff', action='store_true', help="Predict the difference between input and ground truth instead of ground truth directly")
     return arg_parser
 
 
@@ -251,19 +282,16 @@ def set_train_args(arg_file=None):
     arg_parser.add_argument('--n-iters-val', type=int, default=1,
                             help="Number of batch iterations used to average the validation loss")
 
-    args = global_args(arg_parser, arg_file)
+    argv = global_args(arg_parser, arg_file)
 
     global passed_args
-    passed_args = get_passed_arguments(args, arg_parser)
+    passed_args = get_passed_arguments(argv, arg_parser)
 
     global early_stopping
     if ('early_stopping_delta' in passed_args.keys()) or ('early_stopping_patience' in passed_args.keys()):
         early_stopping = True
     else:
         early_stopping = False
-
-    if globals()["val_names"] is None:
-        globals()["val_names"] = globals()["data_names"].copy()
 
     set_lambdas()
 
@@ -289,4 +317,10 @@ def set_evaluate_args(arg_file=None, prog_func=None):
                             help="Do not merge the outputs when using multiple models and/or partitions")
     arg_parser.add_argument('-f', '--load-from-file', type=str, action=LoadFromFile,
                             help="Load all the arguments from a text file")
+    arg_parser.add_argument('--cut-min', type=float, default=None,
+                            help="Set all values smaller than this to value")
+    arg_parser.add_argument('--cut-max', type=float, default=None,
+                            help="Set all values greater than this to value")
+    arg_parser.add_argument('--reverse-width', action='store_true', help="Revers order of width-axis")
+    arg_parser.add_argument('--reverse-height', action='store_true', help="Revers order of height-axis")
     global_args(arg_parser, arg_file, prog_func)
